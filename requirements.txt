@@ -1,0 +1,4 @@
+Flask
+langgraph
+openai
+python-dotenv
