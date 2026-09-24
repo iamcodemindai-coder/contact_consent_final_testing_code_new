@@ -323,3 +323,405 @@ Output Format:
     ]
 }
 """
+
+import os
+import json
+import logging
+import requests
+
+from dotenv import load_dotenv
+from urllib.parse import urlparse
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv()
+
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# CONFIGURATION CHECK
+# ============================================================
+
+logger.info(
+    "Contact Agent configuration: base_url=%s, model=%s, "
+    "client_id_present=%s, client_secret_present=%s",
+    OPENAI_BASE_URL or "<missing>",
+    OPENAI_MODEL or "<missing>",
+    bool(CLIENT_ID),
+    bool(CLIENT_SECRET)
+)
+
+
+# ============================================================
+# CONTACT AGENT PROMPT
+# ============================================================
+
+CONTACT_AGENT_PROMPT = """
+You are a Contact Information Extraction Agent.
+
+Your task is to extract all relevant Patient and HCP contact
+information from the provided Chatqna transcript.
+
+Rules:
+
+1. Identify every distinct Patient and HCP mentioned in the conversation.
+2. Keep contacts in their first appearance order.
+3. If a value is corrected later in the conversation, use the latest
+   corrected value.
+4. Do not invent information.
+5. If a field is not available, use "Unknown".
+6. Date of Birth should be returned in MM/DD/YY format whenever available.
+7. Extract only information that is explicitly present in the transcript.
+8. Keep the response strictly in JSON format.
+
+Return the following structure:
+
+{
+    "chat_response": [
+        {
+            "contact_type": "Patient or HCP",
+            "contact_role": "Patient or HCP",
+            "first_name": "value",
+            "last_name": "value",
+            "date_of_birth": "MM/DD/YY or Unknown",
+            "phone_number": "value or Unknown",
+            "email": "value or Unknown",
+            "address": "value or Unknown"
+        }
+    ],
+    "contact_confidence_score": 0.0,
+    "reported_verbatim": []
+}
+
+Confidence score should be between 0 and 1.
+
+reported_verbatim should contain relevant exact statements from
+the conversation that support the extracted contact information.
+"""
+
+
+# ============================================================
+# EMPTY RESULT
+# ============================================================
+
+def empty_result():
+    return {
+        "chat_response": [],
+        "contact_confidence_score": 0.0,
+        "reported_verbatim": []
+    }
+
+
+# ============================================================
+# GET DATABRICKS OAUTH ACCESS TOKEN
+# ============================================================
+
+def get_databricks_access_token():
+
+    if not OPENAI_BASE_URL:
+        raise RuntimeError("OPENAI_BASE_URL is missing in .env")
+
+    if not CLIENT_ID:
+        raise RuntimeError("CLIENT_ID is missing in .env")
+
+    if not CLIENT_SECRET:
+        raise RuntimeError("CLIENT_SECRET is missing in .env")
+
+    parsed_url = urlparse(OPENAI_BASE_URL)
+
+    workspace_url = (
+        f"{parsed_url.scheme}://{parsed_url.netloc}"
+    )
+
+    token_url = f"{workspace_url}/oidc/v1/token"
+
+    logger.info("Requesting Databricks OAuth access token...")
+
+    response = requests.post(
+        token_url,
+        auth=(CLIENT_ID, CLIENT_SECRET),
+        data={
+            "grant_type": "client_credentials",
+            "scope": "all-apis"
+        },
+        timeout=30
+    )
+
+    if response.status_code != 200:
+
+        logger.error(
+            "OAuth token request failed. status=%s response=%s",
+            response.status_code,
+            response.text
+        )
+
+        raise RuntimeError(
+            f"OAuth token generation failed: HTTP {response.status_code}"
+        )
+
+    token_data = response.json()
+
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        raise RuntimeError(
+            "OAuth response does not contain access_token"
+        )
+
+    logger.info(
+        "Databricks OAuth access token generated successfully"
+    )
+
+    # NEVER print/log the actual token
+    return access_token
+
+
+# ============================================================
+# PARSE JSON RESPONSE
+# ============================================================
+
+def parse_json_response(content):
+
+    if not content:
+        return empty_result()
+
+    content = content.strip()
+
+    # Remove markdown code fences if model returns them
+    if content.startswith("```json"):
+        content = content[7:]
+
+    elif content.startswith("```"):
+        content = content[3:]
+
+    if content.endswith("```"):
+        content = content[:-3]
+
+    content = content.strip()
+
+    try:
+        result = json.loads(content)
+
+        if not isinstance(result, dict):
+            return empty_result()
+
+        result.setdefault("chat_response", [])
+        result.setdefault("contact_confidence_score", 0.0)
+        result.setdefault("reported_verbatim", [])
+
+        return result
+
+    except json.JSONDecodeError as e:
+
+        logger.error(
+            "Failed to parse Contact Agent JSON response: %s",
+            str(e)
+        )
+
+        logger.error(
+            "Raw model response: %s",
+            content
+        )
+
+        return empty_result()
+
+
+# ============================================================
+# EXTRACT CONTACTS
+# ============================================================
+
+def extract_contacts(chatqna):
+
+    logger.info("CONTACT AGENT STARTED")
+
+    if not chatqna:
+        logger.warning("Chatqna is empty")
+
+        return empty_result()
+
+    try:
+
+        # ----------------------------------------------------
+        # Generate OAuth token
+        # ----------------------------------------------------
+
+        access_token = get_databricks_access_token()
+
+        # ----------------------------------------------------
+        # Databricks Chat Completions URL
+        # ----------------------------------------------------
+
+        url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
+
+        # ----------------------------------------------------
+        # Headers
+        # ----------------------------------------------------
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        # ----------------------------------------------------
+        # Request payload
+        # ----------------------------------------------------
+
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": CONTACT_AGENT_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": chatqna
+                }
+            ]
+        }
+
+        logger.info(
+            "Calling Databricks Chat Completions API..."
+        )
+
+        # ----------------------------------------------------
+        # API CALL
+        # ----------------------------------------------------
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=120
+        )
+
+        logger.info(
+            "Databricks response status=%s",
+            response.status_code
+        )
+
+        # ----------------------------------------------------
+        # ERROR HANDLING
+        # ----------------------------------------------------
+
+        if response.status_code != 200:
+
+            logger.error(
+                "Databricks API error: %s",
+                response.text
+            )
+
+            response.raise_for_status()
+
+        # ----------------------------------------------------
+        # RESPONSE JSON
+        # ----------------------------------------------------
+
+        response_data = response.json()
+
+        # ----------------------------------------------------
+        # EXTRACT MODEL CONTENT
+        # ----------------------------------------------------
+
+        choices = response_data.get("choices", [])
+
+        if not choices:
+            logger.error(
+                "Databricks response does not contain choices"
+            )
+
+            return empty_result()
+
+        message = choices[0].get("message", {})
+
+        content = message.get("content", "")
+
+        # ----------------------------------------------------
+        # PARSE CONTACT RESULT
+        # ----------------------------------------------------
+
+        result = parse_json_response(content)
+
+        # ----------------------------------------------------
+        # LOCAL TEST PRINT
+        # ----------------------------------------------------
+
+        print("\n")
+        print("=" * 70)
+        print("CONTACT AGENT RESULT")
+        print("=" * 70)
+        print(json.dumps(result, indent=4, ensure_ascii=False))
+        print("=" * 70)
+        print("\n")
+
+        logger.info(
+            "CONTACT AGENT COMPLETED"
+        )
+
+        return result
+
+    except Exception as e:
+
+        logger.exception(
+            "Contact Agent failed during API call"
+        )
+
+        print("\n")
+        print("=" * 70)
+        print("CONTACT AGENT ERROR")
+        print("=" * 70)
+        print(str(e))
+        print("=" * 70)
+        print("\n")
+
+        return empty_result()
+
+
+# ============================================================
+# LOCAL TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("\n")
+    print("=" * 70)
+    print("CONTACT AGENT LOCAL TEST")
+    print("=" * 70)
+
+    test_chatqna = """
+Patient name is John Smith.
+Date of birth is 01/15/85.
+His phone number is 9876543210.
+
+The HCP is Dr. Sarah Johnson.
+Her email is sarah.johnson@example.com.
+"""
+
+    result = extract_contacts(test_chatqna)
+
+    print("\nFINAL RESULT:")
+    print(json.dumps(result, indent=4, ensure_ascii=False))
+
+
+
+
